@@ -15,7 +15,6 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
 };
 
 use crate::Args;
@@ -29,12 +28,18 @@ use crossterm::{
 
 use lazy_static::lazy_static;
 use thiserror::Error;
-use tokio::{sync::mpsc::Sender, task, time::sleep};
+use tokio::{
+    sync::{
+        mpsc::{Receiver, Sender},
+        watch,
+    },
+    task,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{Messages, Player};
 
-mod components;
+pub mod components;
 mod input;
 
 /// The error type for the UI, which is used to handle errors that occur
@@ -49,6 +54,26 @@ pub enum UIError {
 
     #[error("sending message to backend failed")]
     Communication(#[from] tokio::sync::mpsc::error::SendError<Messages>),
+
+    #[error("failed to send UI event")]
+    UiSend(#[from] tokio::sync::mpsc::error::SendError<UIEvent>),
+}
+
+/// Events that trigger UI updates
+#[derive(Debug, Clone)]
+pub enum UIEvent {
+    /// Redraw the entire UI
+    Redraw,
+    /// Volume changed
+    VolumeChanged,
+    /// Track changed
+    TrackChanged,
+    /// Playback state changed (play/pause)
+    PlaybackStateChanged,
+    /// Progress update (for progress bar)
+    ProgressUpdate,
+    /// Bookmark state changed
+    BookmarkChanged,
 }
 
 /// How long the audio bar will be visible for when audio is adjusted.
@@ -160,53 +185,94 @@ impl Window {
 /// * `minimalist` - All this does is hide the bottom control bar.
 /// * `borderless` - Whether to include borders or not.
 /// * `width` - The width of player
+/// * `ui_rx` - Receiver for UI events
 async fn interface(
     player: Arc<Player>,
     minimalist: bool,
     borderless: bool,
-    fps: u8,
     width: usize,
+    mut ui_rx: Receiver<UIEvent>,
+    mut progress_rx: watch::Receiver<UIEvent>,
 ) -> eyre::Result<(), UIError> {
     let mut window = Window::new(width, borderless);
 
+    // Initial draw
+    draw_ui(&mut window, &player, minimalist, width)?;
+
     loop {
-        // Load `current` once so that it doesn't have to be loaded over and over
-        // again by different UI components.
-        let current = player.current.load();
-        let current = current.as_ref();
+        tokio::select! {
+            // 1) UI events from input or other sources
+            Some(event) = ui_rx.recv() => {
+                match event {
+                    UIEvent::VolumeChanged
+                    | UIEvent::Redraw
+                    | UIEvent::TrackChanged
+                    | UIEvent::PlaybackStateChanged
+                    | UIEvent::BookmarkChanged => {
+                        draw_ui(&mut window, &player, minimalist, width)?;
+                    }
+                    UIEvent::ProgressUpdate => {
+                        // only if playing
+                        if !player.sink.is_paused() && player.current_exists() {
+                            draw_ui(&mut window, &player, minimalist, width)?;
+                        }
+                    }
+                }
+            }
 
-        let action = components::action(&player, current, width);
+            // 2) Progress‐updates from the player watch channel
+            //    (fires every time the player sends .send(()))
+            Ok(_) = progress_rx.changed() => {
+                // coerce into our own enum and reuse the same match branch
+                if !player.sink.is_paused() && player.current_exists() {
+                    draw_ui(&mut window, &player, minimalist, width)?;
+                }
+            }
 
-        let volume = player.sink.volume();
-        let percentage = format!("{}%", (volume * 100.0).round().abs());
-
-        let timer = VOLUME_TIMER.load(Ordering::Relaxed);
-        let middle = match timer {
-            0 => components::progress_bar(&player, current, width - 16),
-            _ => components::audio_bar(volume, &percentage, width - 17),
-        };
-
-        if timer > 0 && timer <= AUDIO_BAR_DURATION {
-            // We'll keep increasing the timer until it eventually hits `AUDIO_BAR_DURATION`.
-            VOLUME_TIMER.fetch_add(1, Ordering::Relaxed);
-        } else {
-            // If enough time has passed, we'll reset it back to 0.
-            VOLUME_TIMER.store(0, Ordering::Relaxed);
         }
-
-        let controls = components::controls(width);
-
-        let menu = if minimalist {
-            vec![action, middle]
-        } else {
-            vec![action, middle, controls]
-        };
-
-        window.draw(menu, false)?;
-
-        let delta = 1.0 / (fps as f32);
-        sleep(Duration::from_secs_f32(delta)).await;
     }
+}
+
+/// Helper function to draw the UI
+fn draw_ui(
+    window: &mut Window,
+    player: &Player,
+    minimalist: bool,
+    width: usize,
+) -> eyre::Result<(), UIError> {
+    // Load `current` once so that it doesn't have to be loaded over and over
+    // again by different UI components.
+    let current = player.current.load();
+    let current = current.as_ref();
+
+    let action = components::action(&player, current, width);
+
+    let volume = player.sink.volume();
+    let percentage = format!("{}%", (volume * 100.0).round().abs());
+
+    let timer = VOLUME_TIMER.load(Ordering::Relaxed);
+    let middle = match timer {
+        0 => components::progress_bar(&player, current, width - 16),
+        _ => components::audio_bar(volume, &percentage, width - 17),
+    };
+
+    if timer > 0 && timer <= AUDIO_BAR_DURATION {
+        // We'll keep increasing the timer until it eventually hits `AUDIO_BAR_DURATION`.
+        VOLUME_TIMER.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // If enough time has passed, we'll reset it back to 0.
+        VOLUME_TIMER.store(0, Ordering::Relaxed);
+    }
+
+    let controls = components::controls(width);
+
+    let menu = if minimalist {
+        vec![action, middle]
+    } else {
+        vec![action, middle, controls]
+    };
+
+    window.draw(menu, false)
 }
 
 /// Represents the terminal environment, and is used to properly
@@ -286,17 +352,43 @@ pub async fn start(
     player: Arc<Player>,
     sender: Sender<Messages>,
     args: Args,
+    mut ui_rx: Receiver<UIEvent>,
+    progress_rx: watch::Receiver<UIEvent>,
 ) -> eyre::Result<(), UIError> {
     let environment = Environment::ready(args.alternate)?;
+
+    // Create UI event channel for input to interface communication
+    let (ui_tx_input, mut ui_rx_input) = tokio::sync::mpsc::channel(100);
+
+    // Create merged receiver that will handle events from both sources
+    let (ui_tx_merged, ui_rx_merged) = tokio::sync::mpsc::channel(100);
+
+    // Spawn task to merge the two event streams
+    let merge_task = task::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(event) = ui_rx.recv() => {
+                    let _ = ui_tx_merged.send(event).await;
+                }
+                Some(event) = ui_rx_input.recv() => {
+                    let _ = ui_tx_merged.send(event).await;
+                }
+            }
+        }
+    });
+
     let interface = task::spawn(interface(
         Arc::clone(&player),
         args.minimalist,
         args.borderless,
-        args.fps,
         21 + args.width.min(32) * 2,
+        ui_rx_merged,
+        progress_rx.clone(),
     ));
 
-    input::listen(sender.clone()).await?;
+    input::listen(sender.clone(), ui_tx_input).await?;
+
+    merge_task.abort();
     interface.abort();
 
     environment.cleanup()?;

@@ -6,12 +6,12 @@ use futures::{FutureExt as _, StreamExt as _};
 use tokio::sync::mpsc::Sender;
 
 use crate::player::{
-    ui::{self, UIError},
+    ui::{self, UIError, UIEvent},
     Messages,
 };
 
 /// Starts the listener to recieve input from the terminal for various events.
-pub async fn listen(sender: Sender<Messages>) -> eyre::Result<(), UIError> {
+pub async fn listen(sender: Sender<Messages>, ui_tx: Sender<UIEvent>) -> eyre::Result<(), UIError> {
     let mut reader = EventStream::new();
 
     loop {
@@ -66,8 +66,22 @@ pub async fn listen(sender: Sender<Messages>) -> eyre::Result<(), UIError> {
             _ => continue,
         };
 
-        if let Messages::ChangeVolume(_) = messages {
-            ui::flash_audio();
+        // Send UI update events based on the message type
+        match messages {
+            Messages::ChangeVolume(_) => {
+                ui::flash_audio();
+                ui_tx.send(UIEvent::VolumeChanged).await?;
+            }
+            Messages::PlayPause | Messages::Pause | Messages::Play => {
+                ui_tx.send(UIEvent::PlaybackStateChanged).await?;
+            }
+            Messages::Next => {
+                ui_tx.send(UIEvent::TrackChanged).await?;
+            }
+            Messages::Bookmark => {
+                ui_tx.send(UIEvent::BookmarkChanged).await?;
+            }
+            _ => {}
         }
 
         sender.send(messages).await?;
