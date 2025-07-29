@@ -10,7 +10,7 @@ use tokio::fs;
 use tokio::{sync::mpsc, task};
 
 use crate::messages::Messages;
-use crate::player::ui;
+use crate::player::ui::{self, UIEvent};
 use crate::player::Player;
 use crate::Args;
 
@@ -102,14 +102,21 @@ pub async fn play(args: Args) -> eyre::Result<()> {
     // Stream kept here in the master thread to keep it alive.
     let (player, stream) = Player::new(&args).await?;
     let player = Arc::new(player);
+    player.set_progress_emit(true);
 
     // Initialize the UI, as well as the internal communication channel.
     let (tx, rx) = mpsc::channel(8);
+
+    // Create UI event channel
+    let (ui_tx, ui_rx) = mpsc::channel(100);
+
     let ui = if stdout().is_terminal() && !(env::var("LOWFI_DISABLE_UI") == Ok("1".to_owned())) {
         Some(task::spawn(ui::start(
             Arc::clone(&player),
             tx.clone(),
             args.clone(),
+            ui_rx,
+            player.subscribe_progress(),
         )))
     } else {
         None
@@ -118,8 +125,11 @@ pub async fn play(args: Args) -> eyre::Result<()> {
     // Sends the player an "init" signal telling it to start playing a song straight away.
     tx.send(Messages::Init).await?;
 
+    // Send initial UI update
+    ui_tx.send(UIEvent::Redraw).await?;
+
     // Actually starts the player.
-    Player::play(Arc::clone(&player), tx.clone(), rx, args.debug).await?;
+    Player::play(Arc::clone(&player), tx.clone(), rx, ui_tx, args.debug).await?;
 
     // Save the volume.txt file for the next session.
     PersistentVolume::save(player.sink.volume()).await?;
