@@ -102,6 +102,7 @@ pub async fn play(args: Args) -> eyre::Result<()> {
     // Stream kept here in the master thread to keep it alive.
     let (player, stream) = Player::new(&args).await?;
     let player = Arc::new(player);
+    player.set_progress_emit(true);
 
     // Initialize the UI, as well as the internal communication channel.
     let (tx, rx) = mpsc::channel(8);

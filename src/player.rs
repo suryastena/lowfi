@@ -35,7 +35,7 @@ use crate::{
     Args,
 };
 
-use ui::{components, UIEvent};
+use ui::UIEvent;
 
 pub mod audio;
 pub mod bookmark;
@@ -57,32 +57,33 @@ pub struct Player {
     /// The internal buffer size
     pub buffer_size: usize,
 
-    /// Cached width for progress bar updates
-    progress_bar_width: usize,
-
     /// Whether the current track has been bookmarked
-    bookmarked: AtomicBool,
+    pub bookmarked: AtomicBool,
 
     /// The [`TrackInfo`] of the current track
-    current: ArcSwapOption<tracks::Info>,
+    pub current: ArcSwapOption<tracks::Info>,
 
     /// The tracks buffer
-    tracks: RwLock<VecDeque<tracks::QueuedTrack>>,
+    pub tracks: RwLock<VecDeque<tracks::QueuedTrack>>,
 
     /// The actual list of tracks to be played
-    list: List,
+    pub list: List,
 
     /// The initial volume level
-    volume: PersistentVolume,
+    pub volume: PersistentVolume,
 
     /// The web client
-    client: Client,
+    pub client: Client,
 
     /// Keep the output stream handle alive
     _handle: OutputStreamHandle,
 
     /// Channel to emit progress updates for the UI
+    /// This is now generic and can trigger any UI event
     progress_tx: watch::Sender<UIEvent>,
+
+    /// Track if we should be emitting progress updates
+    emit_progress: AtomicBool,
 }
 
 impl Player {
@@ -106,12 +107,13 @@ impl Player {
         self.progress_tx.subscribe()
     }
 
+    /// Enable or disable progress emit
+    pub fn set_progress_emit(&self, emit: bool) {
+        self.emit_progress.store(emit, Ordering::Relaxed);
+    }
+
     /// Initializes the entire player, including audio devices & sink
     pub async fn new(args: &Args) -> eyre::Result<(Self, SendableOutputStream)> {
-        // Compute UI progress bar width: full_width - 16
-        let full_width = 21 + args.width.min(32) * 2;
-        let progress_bar_width = full_width.saturating_sub(16);
-
         // Create watch channel for progress updates
         let (progress_tx, _) = watch::channel(UIEvent::ProgressUpdate);
 
@@ -148,7 +150,6 @@ impl Player {
         let player = Self {
             sink,
             buffer_size: args.buffer_size,
-            progress_bar_width,
             bookmarked: AtomicBool::new(false),
             current: ArcSwapOption::new(None),
             tracks: RwLock::new(VecDeque::with_capacity(args.buffer_size)),
@@ -157,9 +158,26 @@ impl Player {
             client,
             _handle: handle,
             progress_tx,
+            emit_progress: AtomicBool::new(true),
         };
 
         Ok((player, SendableOutputStream(stream)))
+    }
+
+    /// Helper to send UI events
+    async fn send_ui_event(ui_tx: &Sender<UIEvent>, event: UIEvent) {
+        let _ = ui_tx.send(event).await;
+    }
+
+    /// Get current playback info for UI components
+    pub fn get_playback_info(&self) -> PlaybackInfo {
+        PlaybackInfo {
+            is_paused: self.sink.is_paused(),
+            is_playing: self.current_exists() && !self.sink.is_paused(),
+            volume: self.sink.volume(),
+            position: self.sink.get_pos(),
+            is_bookmarked: self.bookmarked.load(Ordering::Relaxed),
+        }
     }
 
     /// This is the main "audio server"
@@ -181,20 +199,19 @@ impl Player {
         Downloader::notify(&itx).await?;
         player.set_volume(player.volume.float());
 
-        // Spawn progress emitter task that only notifies on actual bar change
-        let mut progress_interval = interval(Duration::from_millis(250));
+        // Spawn progress emitter task
+        // This emits generic ProgressUpdate events that components can interpret
+        let progress_interval_ms = 100;
+        let mut progress_interval = interval(Duration::from_millis(progress_interval_ms));
         let progress_tx = player.progress_tx.clone();
         let p = Arc::clone(&player);
-        let mut last_bar = String::new();
         let progress_task = task::spawn(async move {
             loop {
                 progress_interval.tick().await;
-                // Compute new progress bar string
-                let current_arc = p.current.load();
-                let current_info = current_arc.as_ref();
-                let new_bar = components::progress_bar(&p, current_info, p.progress_bar_width);
-                if new_bar != last_bar {
-                    last_bar = new_bar;
+                if p.emit_progress.load(Ordering::Relaxed)
+                    && p.current_exists()
+                    && !p.sink.is_paused()
+                {
                     let _ = progress_tx.send(UIEvent::ProgressUpdate);
                 }
             }
@@ -217,7 +234,7 @@ impl Player {
                     if msg == Messages::Next && !player.current_exists() {
                         continue;
                     }
-                    let _ = ui_tx.send(UIEvent::TrackChanged).await;
+                    Self::send_ui_event(&ui_tx, UIEvent::TrackChanged).await;
                     task::spawn(Self::next(
                         Arc::clone(&player),
                         itx.clone(),
@@ -227,13 +244,13 @@ impl Player {
                 }
                 Messages::Play => {
                     player.sink.play();
-                    let _ = ui_tx.send(UIEvent::PlaybackStateChanged).await;
+                    Self::send_ui_event(&ui_tx, UIEvent::PlaybackStateChanged).await;
                     #[cfg(feature = "mpris")]
                     mpris.playback(PlaybackStatus::Playing).await?;
                 }
                 Messages::Pause => {
                     player.sink.pause();
-                    let _ = ui_tx.send(UIEvent::PlaybackStateChanged).await;
+                    Self::send_ui_event(&ui_tx, UIEvent::PlaybackStateChanged).await;
                     #[cfg(feature = "mpris")]
                     mpris.playback(PlaybackStatus::Paused).await?;
                 }
@@ -243,7 +260,7 @@ impl Player {
                     } else {
                         player.sink.pause();
                     }
-                    let _ = ui_tx.send(UIEvent::PlaybackStateChanged).await;
+                    Self::send_ui_event(&ui_tx, UIEvent::PlaybackStateChanged).await;
                     #[cfg(feature = "mpris")]
                     mpris
                         .playback(mpris.player().playback_status().await?)
@@ -251,7 +268,7 @@ impl Player {
                 }
                 Messages::ChangeVolume(change) => {
                     player.set_volume(player.sink.volume() + change);
-                    let _ = ui_tx.send(UIEvent::VolumeChanged).await;
+                    Self::send_ui_event(&ui_tx, UIEvent::VolumeChanged).await;
                     #[cfg(feature = "mpris")]
                     mpris
                         .changed(vec![Property::Volume(player.sink.volume().into())])
@@ -259,7 +276,7 @@ impl Player {
                 }
                 Messages::NewSong => {
                     new = true;
-                    let _ = ui_tx.send(UIEvent::TrackChanged).await;
+                    Self::send_ui_event(&ui_tx, UIEvent::TrackChanged).await;
                     #[cfg(feature = "mpris")]
                     mpris
                         .changed(vec![
@@ -282,7 +299,7 @@ impl Player {
                     )
                     .await?;
                     player.bookmarked.swap(bookmarked, Ordering::Relaxed);
-                    let _ = ui_tx.send(UIEvent::BookmarkChanged).await;
+                    Self::send_ui_event(&ui_tx, UIEvent::BookmarkChanged).await;
                 }
                 Messages::Quit => break,
             }
@@ -293,4 +310,14 @@ impl Player {
 
         Ok(())
     }
+}
+
+/// Playback information for UI components
+#[derive(Debug, Clone, Copy)]
+pub struct PlaybackInfo {
+    pub is_paused: bool,
+    pub is_playing: bool,
+    pub volume: f32,
+    pub position: Duration,
+    pub is_bookmarked: bool,
 }
